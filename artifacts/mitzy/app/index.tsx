@@ -7,6 +7,7 @@ import {
   ActivityIndicator,
   Animated,
   FlatList,
+  Image,
   Modal,
   Platform,
   Pressable,
@@ -45,6 +46,8 @@ export default function HomeScreen() {
   const palette = useColors();
   const insets = useSafeAreaInsets();
   const pulse = useRef(new Animated.Value(1)).current;
+  const mascotFloat = useRef(new Animated.Value(0)).current;
+  const mascotPulse = useRef(new Animated.Value(1)).current;
   const [connection, setConnection] = useState<ConnectionState>('connected');
   const [currentSign, setCurrentSign] = useState('Hello');
   const [confidence, setConfidence] = useState(0.98);
@@ -55,6 +58,7 @@ export default function HomeScreen() {
   const [autoSpeak, setAutoSpeak] = useState(true);
   const [speechRate, setSpeechRate] = useState(0.9);
   const [isSpeaking, setIsSpeaking] = useState(false);
+  const [isRecognizing, setIsRecognizing] = useState(false);
 
   const styles = useMemo(() => makeStyles(palette), [palette]);
 
@@ -99,6 +103,54 @@ export default function HomeScreen() {
     return () => animation.stop();
   }, [connection, pulse]);
 
+  useEffect(() => {
+    const animation = Animated.loop(
+      Animated.sequence([
+        Animated.timing(mascotFloat, {
+          toValue: -5,
+          duration: 1900,
+          useNativeDriver: true,
+        }),
+        Animated.timing(mascotFloat, {
+          toValue: 0,
+          duration: 1900,
+          useNativeDriver: true,
+        }),
+      ]),
+    );
+    animation.start();
+    return () => animation.stop();
+  }, [mascotFloat]);
+
+  useEffect(() => {
+    if (!isSpeaking && !isRecognizing) {
+      mascotPulse.stopAnimation();
+      Animated.spring(mascotPulse, {
+        toValue: 1,
+        useNativeDriver: true,
+        speed: 14,
+        bounciness: 5,
+      }).start();
+      return;
+    }
+    const animation = Animated.loop(
+      Animated.sequence([
+        Animated.timing(mascotPulse, {
+          toValue: 1.06,
+          duration: 360,
+          useNativeDriver: true,
+        }),
+        Animated.timing(mascotPulse, {
+          toValue: 1,
+          duration: 360,
+          useNativeDriver: true,
+        }),
+      ]),
+    );
+    animation.start();
+    return () => animation.stop();
+  }, [isSpeaking, isRecognizing, mascotPulse]);
+
   const announce = async (text: string) => {
     if (!autoSpeak) return;
     await Speech.stop();
@@ -114,6 +166,8 @@ export default function HomeScreen() {
   const recognizeDemoGesture = async () => {
     if (connection !== 'connected') return;
     await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    setIsRecognizing(true);
+    setTimeout(() => setIsRecognizing(false), 850);
     const next = DEMO_GESTURES[(recentSigns.length + 1) % DEMO_GESTURES.length];
     setCurrentSign(next.label);
     setConfidence(next.confidence);
@@ -246,6 +300,42 @@ export default function HomeScreen() {
           <Text style={styles.subtitle}>
             Your signs appear here as words, in real time.
           </Text>
+        </View>
+
+        <View style={styles.mascotStage}>
+          <Animated.View
+            style={[
+              styles.mascotWrap,
+              {
+                transform: [
+                  { translateY: mascotFloat },
+                  { scale: mascotPulse },
+                ],
+              },
+            ]}
+          >
+            <Image
+              accessibilityLabel="Mitzy mascot"
+              source={require('../assets/images/mitzy-mascot.png')}
+              style={styles.mascotImage}
+            />
+          </Animated.View>
+          <View style={styles.mascotStatus}>
+            <View style={[styles.mascotStatusDot, (isSpeaking || isRecognizing) && styles.mascotStatusDotActive]} />
+            <Text style={styles.mascotStatusText}>
+              {isSpeaking ? 'Mitzy is speaking' : isRecognizing ? 'Recognizing your sign' : 'Mitzy is listening'}
+            </Text>
+          </View>
+          {isSpeaking && (
+            <View style={styles.speechBubble}>
+              <Feather name="volume-2" size={14} color={palette.primary} />
+              <View style={styles.speechDots}>
+                <View style={styles.speechDot} />
+                <View style={styles.speechDot} />
+                <View style={styles.speechDot} />
+              </View>
+            </View>
+          )}
         </View>
 
         <View style={styles.liveCard}>
@@ -582,6 +672,16 @@ const makeStyles = (palette: ReturnType<typeof useColors>) =>
     greeting: { color: palette.mutedForeground, fontFamily: 'Inter_500Medium', fontSize: 15, marginBottom: 3 },
     title: { color: palette.foreground, fontFamily: 'Inter_700Bold', fontSize: 29, letterSpacing: -1.1 },
     subtitle: { color: palette.mutedForeground, fontFamily: 'Inter_400Regular', fontSize: 13, lineHeight: 19, marginTop: 7 },
+    mascotStage: { height: 160, borderRadius: 25, backgroundColor: palette.card, alignItems: 'center', justifyContent: 'flex-end', marginBottom: 18, overflow: 'hidden', position: 'relative' },
+    mascotWrap: { width: 210, height: 210, alignItems: 'center', justifyContent: 'center', marginBottom: -48 },
+    mascotImage: { width: 210, height: 210 },
+    mascotStatus: { position: 'absolute', bottom: 11, left: 0, right: 0, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6 },
+    mascotStatusDot: { width: 6, height: 6, borderRadius: 4, backgroundColor: palette.primary, opacity: 0.45 },
+    mascotStatusDotActive: { backgroundColor: palette.success, opacity: 1 },
+    mascotStatusText: { color: palette.accentForeground, fontFamily: 'Inter_600SemiBold', fontSize: 10 },
+    speechBubble: { position: 'absolute', top: 22, right: 22, paddingHorizontal: 10, paddingVertical: 8, borderRadius: 14, backgroundColor: palette.card, flexDirection: 'row', alignItems: 'center', gap: 7, shadowColor: palette.primary, shadowOpacity: 0.14, shadowRadius: 8, shadowOffset: { width: 0, height: 4 }, elevation: 3 },
+    speechDots: { flexDirection: 'row', gap: 3, alignItems: 'center' },
+    speechDot: { width: 3, height: 3, borderRadius: 3, backgroundColor: palette.primary },
     liveCard: { backgroundColor: palette.primary, borderRadius: 28, overflow: 'hidden', shadowColor: palette.primary, shadowOpacity: 0.22, shadowRadius: 20, shadowOffset: { width: 0, height: 12 }, elevation: 5 },
     liveCardTop: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', padding: 19, paddingBottom: 0 },
     liveLabelRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
