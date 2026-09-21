@@ -1,0 +1,23 @@
+{
+  "expo": {
+    "name": "Mitzy",
+    "slug": "mitzy",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/images/mitzy-icon.png",
+    "scheme": "mitzy",
+    "userInterfaceStyle": "automatic",
+    "ios": {
+      "supportsTablet": false
+    },
+    "android": {},
+    "web": {
+      "favicon": "./assets/images/mitzy-icon.png"
+    },
+    "plugins": ["expo-router"],
+    "experiments": {
+      "typedRoutes": true,
+      "reactCompiler": true
+    }
+  }
+}

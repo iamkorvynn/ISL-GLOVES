@@ -1,0 +1,24 @@
+kind = "mobile"
+previewPath = "/"
+title = "Mitzy"
+description = "A calm ISL glove companion for translating hand gestures into readable text and speech. Helps a signer connect a glove, recognize gestures in real time, and review recent signs during a conversation."
+version = "1.0.0"
+id = "artifacts/mitzy"
+router = "expo-domain"
+
+[[services]]
+name = "expo"
+ensurePreviewReachable = "/status"
+paths = [ "/" ]
+localPort = 25607
+
+[services.development]
+run = "pnpm --filter @workspace/mitzy run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/mitzy", "run", "build" ]
+run = [ "pnpm", "--filter", "@workspace/mitzy", "run", "serve" ]
+
+[services.env]
+PORT = "25607"
+BASE_PATH = "/"

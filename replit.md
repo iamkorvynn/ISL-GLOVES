@@ -1,6 +1,6 @@
-# [Project name]
+# Mitzy
 
-_Replace the heading above with the project's name, and this line with one sentence describing what this app does for users._
+Mitzy is a calm ISL glove companion that turns recognized hand gestures into readable text and spoken language.
 
 ## Run & Operate
 
@@ -22,23 +22,31 @@ _Replace the heading above with the project's name, and this line with one sente
 
 ## Where things live
 
-_Populate as you build — short repo map plus pointers to the source-of-truth file for DB schema, API contracts, theme files, etc._
+- `artifacts/mitzy/app/index.tsx` — the mobile recognition experience, settings sheet, and calibration flow
+- `artifacts/mitzy/constants/colors.ts` — Mitzy's semantic color tokens
+- `artifacts/mitzy/assets/images/mitzy-icon.png` — app icon
+- `artifacts/api-server` — shared API scaffold, currently not required by the mobile first build
 
 ## Architecture decisions
 
-_Populate as you build — non-obvious choices a reader couldn't infer from the code (3-5 bullets)._
+- The first build is frontend-only and keeps session preferences on-device with AsyncStorage; no account or backend is needed for the core glove flow.
+- The mobile preview uses a simulated glove connection and gesture trigger so the recognition experience is testable before firmware UUIDs and BLE characteristics are finalized.
+- Mitzy uses a single-screen experience with modal settings and calibration flows instead of tab navigation to keep the signer/listener interaction focused.
 
 ## Product
 
-_Describe the high-level user-facing capabilities of this app once they exist._
+- Shows a persistent glove connection state with connect/disconnect behavior.
+- Presents the latest recognized sign with confidence feedback and an auto-speak state.
+- Includes a recent signs log, speech settings, and a three-step calibration flow.
+- Uses a soft cobalt, cream, and mint visual system inspired by the provided reference screens.
 
 ## User preferences
 
-_Populate as you build — explicit user instructions worth remembering across sessions._
+- App name: Mitzy.
 
 ## Gotchas
 
-_Populate as you build — sharp edges, "always run X before Y" rules._
+- Final BLE service and characteristic UUIDs are intentionally not hardcoded until the glove firmware contract is finalized.
 
 ## Pointers
 
