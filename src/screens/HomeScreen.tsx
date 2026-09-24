@@ -111,6 +111,40 @@ export default function HomeScreen() {
     return 'disconnected';
   })();
 
+  // ── BLE error banner ─────────────────────────────────────────────────────
+  const [bannerMessage, setBannerMessage] = useState<string | null>(null);
+  const bannerAnim = useRef(new Animated.Value(0)).current;
+  const bannerTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const dismissBanner = useCallback(() => {
+    Animated.timing(bannerAnim, {
+      toValue: 0,
+      duration: 280,
+      useNativeDriver: true,
+    }).start(() => setBannerMessage(null));
+    if (bannerTimer.current) clearTimeout(bannerTimer.current);
+  }, [bannerAnim]);
+
+  const showBanner = useCallback(
+    (msg: string) => {
+      setBannerMessage(msg);
+      if (bannerTimer.current) clearTimeout(bannerTimer.current);
+      Animated.spring(bannerAnim, {
+        toValue: 1,
+        useNativeDriver: true,
+        speed: 18,
+        bounciness: 6,
+      }).start();
+      bannerTimer.current = setTimeout(dismissBanner, 5000);
+    },
+    [bannerAnim, dismissBanner],
+  );
+
+  // Show banner whenever bleError changes to a non-null value
+  useEffect(() => {
+    if (bleError) showBanner(bleError);
+  }, [bleError, showBanner]);
+
   const styles = useMemo(() => makeStyles(palette), [palette]);
 
   useEffect(() => {
@@ -284,6 +318,45 @@ export default function HomeScreen() {
 
   return (
     <View style={styles.screen}>
+      {/* ── BLE Error Banner ── */}
+      {bannerMessage && (
+        <Animated.View
+          style={[
+            styles.bleBanner,
+            {
+              transform: [
+                {
+                  translateY: bannerAnim.interpolate({
+                    inputRange: [0, 1],
+                    outputRange: [-120, insets.top + 12],
+                  }),
+                },
+              ],
+              opacity: bannerAnim,
+            },
+          ]}
+          pointerEvents="box-none"
+        >
+          <Feather name="bluetooth-off" size={16} color="#fff" style={styles.bleBannerIcon} />
+          <Text style={styles.bleBannerText} numberOfLines={2}>
+            {bannerMessage}
+          </Text>
+          <Pressable
+            onPress={dismissBanner}
+            style={styles.bleBannerClose}
+            accessibilityLabel="Dismiss error"
+          >
+            <Feather name="x" size={15} color="#fff" />
+          </Pressable>
+          <Pressable
+            onPress={() => { dismissBanner(); connectGlove(); }}
+            style={styles.bleBannerRetry}
+            accessibilityLabel="Retry BLE connection"
+          >
+            <Text style={styles.bleBannerRetryText}>Retry</Text>
+          </Pressable>
+        </Animated.View>
+      )}
       <ScrollView
         contentContainerStyle={[
           styles.scrollContent,
@@ -1087,6 +1160,54 @@ const makeStyles = (palette: ReturnType<typeof useColors>) =>
     calibrationTitle: { color: palette.accentForeground, fontWeight: '600', fontSize: 12 },
     calibrationText: { color: palette.mutedForeground, fontWeight: '400', fontSize: 11, marginTop: 3 },
     pressed: { opacity: 0.76 },
+    // ── BLE error banner
+    bleBanner: {
+      position: 'absolute',
+      left: 16,
+      right: 16,
+      zIndex: 999,
+      backgroundColor: palette.destructive,
+      borderRadius: 16,
+      flexDirection: 'row',
+      alignItems: 'center',
+      paddingVertical: 12,
+      paddingHorizontal: 14,
+      gap: 8,
+      shadowColor: '#000',
+      shadowOpacity: 0.22,
+      shadowRadius: 12,
+      shadowOffset: { width: 0, height: 6 },
+      elevation: 8,
+    },
+    bleBannerIcon: { flexShrink: 0 },
+    bleBannerText: {
+      flex: 1,
+      color: '#fff',
+      fontSize: 12,
+      fontWeight: '500',
+      lineHeight: 17,
+    },
+    bleBannerClose: {
+      width: 28,
+      height: 28,
+      borderRadius: 8,
+      backgroundColor: 'rgba(255,255,255,0.18)',
+      alignItems: 'center',
+      justifyContent: 'center',
+      flexShrink: 0,
+    },
+    bleBannerRetry: {
+      paddingVertical: 5,
+      paddingHorizontal: 10,
+      borderRadius: 8,
+      backgroundColor: 'rgba(255,255,255,0.22)',
+      flexShrink: 0,
+    },
+    bleBannerRetryText: {
+      color: '#fff',
+      fontSize: 11,
+      fontWeight: '700',
+    },
     modalBackdrop: { flex: 1, backgroundColor: 'rgba(17,18,39,0.34)', justifyContent: 'flex-end' },
     modalDismissArea: { flex: 1 },
     sheet: {
