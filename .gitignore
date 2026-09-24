@@ -47,3 +47,24 @@ Thumbs.db
 # Replit
 .cache/
 .local/
+
+# Android build & local files
+.gradle
+android/.gradle
+build/
+android/build/
+android/app/build/
+android/local.properties
+.cxx/
+android/.cxx/
+android/app/.cxx/
+
+# iOS build & user state
+ios/Pods/
+ios/build/
+*.xcuserstate
+
+# Backups & workspace files
+*.bak
+.kilo/
+
