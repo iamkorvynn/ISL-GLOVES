@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import Feather from 'react-native-vector-icons/Feather';
 import {
@@ -19,6 +19,8 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useColors } from '../hooks/useColors';
 import { speakText, stopSpeech } from '../services/speech';
 import { hapticLight, hapticMedium, hapticSelection } from '../services/haptics';
+import { useBLE } from '../hooks/useBLE';
+import type { GloveGesture } from '../services/ble';
 
 type ConnectionState = 'connected' | 'connecting' | 'disconnected';
 type RecentSign = {
@@ -34,6 +36,7 @@ const INITIAL_SIGNS: RecentSign[] = [
   { id: '3', label: 'How are you?', time: '10:41 AM', confidence: 0.91 },
 ];
 
+// Demo gestures used as fallback when BLE glove is not connected
 const DEMO_GESTURES = [
   { label: 'Hello', confidence: 0.98 },
   { label: 'Thank you', confidence: 0.94 },
@@ -47,7 +50,8 @@ export default function HomeScreen() {
   const pulse = useRef(new Animated.Value(1)).current;
   const mascotFloat = useRef(new Animated.Value(0)).current;
   const mascotPulse = useRef(new Animated.Value(1)).current;
-  const [connection, setConnection] = useState<ConnectionState>('connected');
+
+  // ── UI state ─────────────────────────────────────────────────────────────
   const [currentSign, setCurrentSign] = useState('Hello');
   const [confidence, setConfidence] = useState(0.98);
   const [recentSigns, setRecentSigns] = useState<RecentSign[]>(INITIAL_SIGNS);
@@ -58,6 +62,54 @@ export default function HomeScreen() {
   const [speechRate, setSpeechRate] = useState(0.9);
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [isRecognizing, setIsRecognizing] = useState(false);
+
+  // ── BLE ──────────────────────────────────────────────────────────────────
+  /** Called by useBLE each time the ESP32 sends a new gesture notification */
+  const handleBleGesture = useCallback(
+    (gesture: GloveGesture) => {
+      hapticLight();
+      setIsRecognizing(true);
+      setTimeout(() => setIsRecognizing(false), 850);
+
+      setCurrentSign(gesture.label);
+      // BLE gestures carry no confidence score; show 1.0
+      setConfidence(1.0);
+
+      const now = new Date(gesture.receivedAt);
+      const timeStr = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+      setRecentSigns((items) =>
+        [
+          {
+            id: `${gesture.receivedAt}-ble`,
+            label: gesture.label,
+            time: 'Now',
+            confidence: 1.0,
+          },
+          ...items
+            .map((item, index) =>
+              index === 0 && item.time === 'Now' ? { ...item, time: timeStr } : item,
+            )
+            .slice(0, 5),
+        ].slice(0, 6),
+      );
+
+      // Auto-speak is handled by the existing `announce` function below
+      announceRef.current(gesture.label);
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [],
+  );
+
+  const { connectionState, bleError, isConnecting, startConnection, stopConnection } =
+    useBLE(handleBleGesture);
+
+  // Map BLE connectionState to the ConnectionState type the UI already uses
+  const connection: ConnectionState = (() => {
+    if (connectionState === 'connected') return 'connected';
+    if (isConnecting) return 'connecting';
+    return 'disconnected';
+  })();
 
   const styles = useMemo(() => makeStyles(palette), [palette]);
 
@@ -162,6 +214,13 @@ export default function HomeScreen() {
     });
   };
 
+  // Stable ref so the BLE gesture callback can call the latest version of announce
+  // without causing re-subscription on every render.
+  const announceRef = useRef(announce);
+  useEffect(() => {
+    announceRef.current = announce;
+  });
+
   const recognizeDemoGesture = async () => {
     if (connection !== 'connected') return;
     hapticLight();
@@ -187,20 +246,15 @@ export default function HomeScreen() {
   };
 
   const connectGlove = async () => {
-    if (connection === 'connected') {
+    if (connectionState === 'connected' || isConnecting) {
       hapticSelection();
-      setConnection('disconnected');
       stopSpeech();
       setIsSpeaking(false);
+      await stopConnection();
       return;
     }
     hapticMedium();
-    setConnection('connecting');
-    setTimeout(() => {
-      setConnection('connected');
-      setCurrentSign('Ready');
-      setConfidence(1);
-    }, 1200);
+    await startConnection();
   };
 
   const setStoredAutoSpeak = (value: boolean) => {
@@ -425,21 +479,24 @@ export default function HomeScreen() {
                     : 'Text only'}
               </Text>
             </View>
-            <Pressable
-              accessibilityRole="button"
-              accessibilityLabel="Simulate a glove gesture"
-              testID="simulate-gesture-button"
-              onPress={recognizeDemoGesture}
-              disabled={connection !== 'connected'}
-              style={({ pressed }) => [
-                styles.gestureButton,
-                connection !== 'connected' && styles.disabledButton,
-                pressed && styles.pressed,
-              ]}
-            >
-              <Text style={styles.gestureButtonText}>Try a gesture</Text>
-              <Feather name="arrow-up-right" size={15} color={palette.primaryForeground} />
-            </Pressable>
+            {/* Show demo button only when BLE is not connected (fallback / demo mode) */}
+            {connectionState !== 'connected' && (
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel="Simulate a glove gesture"
+                testID="simulate-gesture-button"
+                onPress={recognizeDemoGesture}
+                disabled={connection !== 'connected'}
+                style={({ pressed }) => [
+                  styles.gestureButton,
+                  connection !== 'connected' && styles.disabledButton,
+                  pressed && styles.pressed,
+                ]}
+              >
+                <Text style={styles.gestureButtonText}>Try a gesture</Text>
+                <Feather name="arrow-up-right" size={15} color={palette.primaryForeground} />
+              </Pressable>
+            )}
           </View>
         </View>
 
@@ -510,6 +567,9 @@ export default function HomeScreen() {
         styles={styles}
         autoSpeak={autoSpeak}
         speechRate={speechRate}
+        connectionState={connectionState}
+        isConnecting={isConnecting}
+        bleError={bleError}
         onClose={() => setSettingsOpen(false)}
         onAutoSpeakChange={setStoredAutoSpeak}
         onSpeechRateChange={setStoredSpeechRate}
@@ -545,6 +605,9 @@ function SettingsModal({
   styles,
   autoSpeak,
   speechRate,
+  connectionState,
+  isConnecting,
+  bleError,
   onClose,
   onAutoSpeakChange,
   onSpeechRateChange,
@@ -555,6 +618,9 @@ function SettingsModal({
   styles: ReturnType<typeof makeStyles>;
   autoSpeak: boolean;
   speechRate: number;
+  connectionState: import('../services/ble').BleConnectionState;
+  isConnecting: boolean;
+  bleError: string | null;
   onClose: () => void;
   onAutoSpeakChange: (value: boolean) => void;
   onSpeechRateChange: (value: number) => void;
@@ -636,8 +702,25 @@ function SettingsModal({
 
           <View style={styles.deviceInfo}>
             <Feather name="bluetooth" size={16} color={palette.mutedForeground} />
-            <Text style={styles.deviceText}>Mitzy Glove · Demo connection</Text>
-            <View style={styles.deviceDot} />
+            <Text style={styles.deviceText}>
+              ISL_GLOVE ·{' '}
+              {connectionState === 'connected'
+                ? 'Connected'
+                : isConnecting
+                  ? 'Connecting…'
+                  : bleError
+                    ? 'Error'
+                    : 'Not connected'}
+            </Text>
+            <View
+              style={[
+                styles.deviceDot,
+                connectionState === 'connected' && { backgroundColor: palette.success },
+                isConnecting && { backgroundColor: palette.warning },
+                connectionState === 'disconnected' &&
+                  !isConnecting && { backgroundColor: palette.destructive },
+              ]}
+            />
           </View>
         </View>
       </View>
