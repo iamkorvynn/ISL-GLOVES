@@ -95,7 +95,7 @@ function decodeGestureValue(base64Value: string | null): string | null {
   if (!base64Value) return null;
   try {
     const bytes = Buffer.from(base64Value, 'base64');
-    return bytes.toString('utf8').trim();
+    return bytes.toString('utf8').replace(/\0/g, '').trim();
   } catch {
     return null;
   }

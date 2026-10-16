@@ -30,10 +30,56 @@ type RecentSign = {
   confidence: number;
 };
 
-const INITIAL_SIGNS: RecentSign[] = [
-  { id: '1', label: 'Hello', time: 'Now', confidence: 0.98 },
-  { id: '2', label: 'Thank you', time: '10:42 AM', confidence: 0.94 },
-  { id: '3', label: 'How are you?', time: '10:41 AM', confidence: 0.91 },
+export type AuditEvent = {
+  id: string;
+  type: 'sign' | 'system' | 'calibration';
+  title: string;
+  detail: string;
+  time: string;
+  date: string;
+  confidence?: number;
+  badge: 'VERIFIED' | 'SYSTEM' | 'INFO';
+};
+
+const INITIAL_AUDIT_LOGS: AuditEvent[] = [
+  {
+    id: 'aud-1',
+    type: 'sign',
+    title: 'Hello',
+    detail: 'Detected via ISL_GLOVE flex sensors • TTS output triggered',
+    time: '11:24:18 AM',
+    date: 'Today',
+    confidence: 0.98,
+    badge: 'VERIFIED',
+  },
+  {
+    id: 'aud-2',
+    type: 'system',
+    title: 'Glove connected',
+    detail: 'BLE GATT notifications subscribed for characteristic 12345678-1234-1234-1234-1234567890cd',
+    time: '11:22:05 AM',
+    date: 'Today',
+    badge: 'SYSTEM',
+  },
+  {
+    id: 'aud-3',
+    type: 'sign',
+    title: 'Thank you',
+    detail: 'Detected via IMU orientation & bend resistance',
+    time: '11:20:41 AM',
+    date: 'Today',
+    confidence: 0.95,
+    badge: 'VERIFIED',
+  },
+  {
+    id: 'aud-4',
+    type: 'calibration',
+    title: 'Sensor baseline calibrated',
+    detail: '5-finger resting resistance calibrated to neutral 0.0V baseline',
+    time: '11:15:30 AM',
+    date: 'Today',
+    badge: 'INFO',
+  },
 ];
 
 // Demo gestures used as fallback when BLE glove is not connected
@@ -44,6 +90,38 @@ const DEMO_GESTURES = [
   { label: 'Please', confidence: 0.96 },
 ];
 
+/**
+ * Deduplicates repeated words or phrases within a raw incoming gesture string.
+ * E.g.
+ *   "Hello Hello Hello Hello" -> "Hello"
+ *   "Hello, Hello, Hello, Hello" -> "Hello"
+ *   "A A A A" -> "A"
+ *   "Thank you Thank you" -> "Thank you"
+ */
+function sanitizeGestureLabel(raw: string): string {
+  if (!raw) return '';
+  const trimmed = raw.trim();
+  if (!trimmed) return '';
+
+  // 1. Check if tokenized by whitespace or comma is repeating the exact same word
+  const tokens = trimmed.split(/[\s,]+/).filter(Boolean);
+  if (tokens.length > 1) {
+    const firstLower = tokens[0].toLowerCase();
+    const allSame = tokens.every((t) => t.toLowerCase() === firstLower);
+    if (allSame) {
+      return tokens[0];
+    }
+  }
+
+  // 2. Check for repeated multi-word phrases (e.g. "Thank you Thank you")
+  const repeatedPhraseMatch = trimmed.match(/^(.+?)(?:\s*[, ]\s*\1)+$/i);
+  if (repeatedPhraseMatch && repeatedPhraseMatch[1]) {
+    return repeatedPhraseMatch[1].trim();
+  }
+
+  return trimmed;
+}
+
 export default function HomeScreen() {
   const palette = useColors();
   const insets = useSafeAreaInsets();
@@ -52,9 +130,16 @@ export default function HomeScreen() {
   const mascotPulse = useRef(new Animated.Value(1)).current;
 
   // ── UI state ─────────────────────────────────────────────────────────────
-  const [currentSign, setCurrentSign] = useState('Hello');
-  const [confidence, setConfidence] = useState(0.98);
-  const [recentSigns, setRecentSigns] = useState<RecentSign[]>(INITIAL_SIGNS);
+  // Navigation tabs (matching PDF Home Page bottom navigation)
+  const [navTab, setNavTab] = useState<'home' | 'audit' | 'insights'>('home');
+  const [translateOpen, setTranslateOpen] = useState(false);
+  const [auditLogs, setAuditLogs] = useState<AuditEvent[]>(INITIAL_AUDIT_LOGS);
+  const [auditFilter, setAuditFilter] = useState<'all' | 'sign' | 'system'>('all');
+
+  // Only show translation and recent signs when an actual input arrives
+  const [currentSign, setCurrentSign] = useState<string | null>(null);
+  const [confidence, setConfidence] = useState<number | null>(null);
+  const [recentSigns, setRecentSigns] = useState<RecentSign[]>([]);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [calibrationOpen, setCalibrationOpen] = useState(false);
   const [calibrationStep, setCalibrationStep] = useState(0);
@@ -63,42 +148,97 @@ export default function HomeScreen() {
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [isRecognizing, setIsRecognizing] = useState(false);
 
-  // ── BLE ──────────────────────────────────────────────────────────────────
-  /** Called by useBLE each time the ESP32 sends a new gesture notification */
-  const handleBleGesture = useCallback(
-    (gesture: GloveGesture) => {
+  // Keep track of the last processed gesture to prevent repeating identical words in quick succession
+  const lastGestureRef = useRef<{ label: string; time: number } | null>(null);
+
+  // ── Process incoming gesture ─────────────────────────────────────────────
+  const processGesture = useCallback(
+    (rawLabel: string, gestureConfidence: number = 1.0) => {
+      const cleanLabel = sanitizeGestureLabel(rawLabel);
+      if (!cleanLabel) return;
+
+      const lower = cleanLabel.toLowerCase();
+      // If the glove sends an idle/rest/none status, clear the debounce tracker
+      if (lower === 'idle' || lower === 'none' || lower === 'rest' || lower === 'neutral') {
+        lastGestureRef.current = null;
+        return;
+      }
+
+      const now = Date.now();
+      // Prevent repeating the same word (e.g. ESP32 microcontroller sending 4 duplicate packets in a loop)
+      if (
+        lastGestureRef.current &&
+        lastGestureRef.current.label.toLowerCase() === lower &&
+        now - lastGestureRef.current.time < 2500
+      ) {
+        lastGestureRef.current.time = now;
+        return;
+      }
+
+      lastGestureRef.current = { label: cleanLabel, time: now };
+
       hapticLight();
       setIsRecognizing(true);
       setTimeout(() => setIsRecognizing(false), 850);
 
-      setCurrentSign(gesture.label);
-      // BLE gestures carry no confidence score; show 1.0
-      setConfidence(1.0);
+      setCurrentSign(cleanLabel);
+      setConfidence(gestureConfidence);
 
-      const now = new Date(gesture.receivedAt);
-      const timeStr = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      const timeStr = new Date(now).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      const timeWithSeconds = new Date(now).toLocaleTimeString([], {
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+      });
 
-      setRecentSigns((items) =>
-        [
+      // Update Recent Signs list
+      setRecentSigns((items) => {
+        // Double-check: do not add consecutive duplicate words to recent signs
+        if (items.length > 0 && items[0].label.toLowerCase() === lower) {
+          return items;
+        }
+
+        return [
           {
-            id: `${gesture.receivedAt}-ble`,
-            label: gesture.label,
+            id: `${now}-${items.length}`,
+            label: cleanLabel,
             time: 'Now',
-            confidence: 1.0,
+            confidence: gestureConfidence,
           },
           ...items
             .map((item, index) =>
               index === 0 && item.time === 'Now' ? { ...item, time: timeStr } : item,
             )
             .slice(0, 5),
-        ].slice(0, 6),
-      );
+        ].slice(0, 6);
+      });
 
-      // Auto-speak is handled by the existing `announce` function below
-      announceRef.current(gesture.label);
+      // Automatically append verified event to Audit Log
+      const newAuditEntry: AuditEvent = {
+        id: `${now}-audit`,
+        type: 'sign',
+        title: cleanLabel,
+        detail: `Gesture recognized with ${(gestureConfidence * 100).toFixed(0)}% confidence • BLE Notification`,
+        time: timeWithSeconds,
+        date: 'Today',
+        confidence: gestureConfidence,
+        badge: 'VERIFIED',
+      };
+      setAuditLogs((prevLogs) => [newAuditEntry, ...prevLogs].slice(0, 100));
+
+      // Auto-speak is announced once per unique gesture
+      announceRef.current(cleanLabel);
     },
-    // eslint-disable-next-line react-hooks/exhaustive-deps
     [],
+  );
+
+  // ── BLE ──────────────────────────────────────────────────────────────────
+  /** Called by useBLE each time the ESP32 sends a new gesture notification */
+  const handleBleGesture = useCallback(
+    (gesture: GloveGesture) => {
+      processGesture(gesture.label, 1.0);
+    },
+    [processGesture],
   );
 
   const { connectionState, bleError, isConnecting, startConnection, stopConnection } =
@@ -110,6 +250,57 @@ export default function HomeScreen() {
     if (isConnecting) return 'connecting';
     return 'disconnected';
   })();
+
+  // Audit logger for connection state changes
+  const prevConnRef = useRef(connectionState);
+  useEffect(() => {
+    if (prevConnRef.current !== connectionState) {
+      prevConnRef.current = connectionState;
+      if (connectionState === 'connected' || connectionState === 'disconnected') {
+        const timeWithSeconds = new Date().toLocaleTimeString([], {
+          hour: '2-digit',
+          minute: '2-digit',
+          second: '2-digit',
+        });
+        const isConn = connectionState === 'connected';
+        const sysEntry: AuditEvent = {
+          id: `${Date.now()}-audit-sys`,
+          type: 'system',
+          title: isConn ? 'Glove connected' : 'Glove disconnected',
+          detail: isConn
+            ? 'BLE link active: ISL_GLOVE device discovered & notification stream established.'
+            : 'BLE link terminated: ISL_GLOVE disconnected from session.',
+          time: timeWithSeconds,
+          date: 'Today',
+          badge: 'SYSTEM',
+        };
+        setAuditLogs((logs) => [sysEntry, ...logs].slice(0, 100));
+      }
+    }
+  }, [connectionState]);
+
+  const handleClearAuditLogs = useCallback(() => {
+    setAuditLogs([]);
+  }, []);
+
+  const handleAddSampleLog = useCallback(() => {
+    const timeWithSeconds = new Date().toLocaleTimeString([], {
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+    });
+    const sampleEntry: AuditEvent = {
+      id: `${Date.now()}-audit-test`,
+      type: 'sign',
+      title: 'Thank you',
+      detail: 'Sample audit event verified • Gesture recognition match 97%',
+      time: timeWithSeconds,
+      date: 'Today',
+      confidence: 0.97,
+      badge: 'VERIFIED',
+    };
+    setAuditLogs((logs) => [sampleEntry, ...logs]);
+  }, []);
 
   // ── BLE error banner ─────────────────────────────────────────────────────
   const [bannerMessage, setBannerMessage] = useState<string | null>(null);
@@ -256,27 +447,10 @@ export default function HomeScreen() {
   });
 
   const recognizeDemoGesture = async () => {
-    if (connection !== 'connected') return;
-    hapticLight();
-    setIsRecognizing(true);
-    setTimeout(() => setIsRecognizing(false), 850);
-    const next = DEMO_GESTURES[(recentSigns.length + 1) % DEMO_GESTURES.length];
-    setCurrentSign(next.label);
-    setConfidence(next.confidence);
-    setRecentSigns((items) => [
-      {
-        id: `${Date.now()}-${items.length}`,
-        label: next.label,
-        time: 'Now',
-        confidence: next.confidence,
-      },
-      ...items.map((item, index) =>
-        index === 0 && item.time === 'Now'
-          ? { ...item, time: 'Just now' }
-          : item,
-      ),
-    ].slice(0, 6));
-    announce(next.label);
+    const next = DEMO_GESTURES[recentSigns.length % DEMO_GESTURES.length];
+    // Reset tracker so simulation always responds when clicked
+    lastGestureRef.current = null;
+    processGesture(next.label, next.confidence);
   };
 
   const connectGlove = async () => {
@@ -310,11 +484,13 @@ export default function HomeScreen() {
         : 'Glove disconnected';
 
   const confidenceLabel =
-    confidence >= 0.94
-      ? 'High confidence'
-      : confidence >= 0.86
-        ? 'Good confidence'
-        : 'Check gesture';
+    confidence === null
+      ? 'Waiting for gesture'
+      : confidence >= 0.94
+        ? 'High confidence'
+        : confidence >= 0.86
+          ? 'Good confidence'
+          : 'Check gesture';
 
   return (
     <View style={styles.screen}>
@@ -357,16 +533,36 @@ export default function HomeScreen() {
           </Pressable>
         </Animated.View>
       )}
-      <ScrollView
-        contentContainerStyle={[
-          styles.scrollContent,
-          {
-            paddingTop: insets.top + 16,
-            paddingBottom: Math.max(insets.bottom, Platform.OS === 'web' ? 34 : 18) + 20,
-          },
-        ]}
-        showsVerticalScrollIndicator={false}
-      >
+      {navTab === 'audit' ? (
+        <AuditLogView
+          palette={palette}
+          styles={styles}
+          auditLogs={auditLogs}
+          auditFilter={auditFilter}
+          setAuditFilter={setAuditFilter}
+          onClearLogs={handleClearAuditLogs}
+          onAddSample={handleAddSampleLog}
+          insets={insets}
+          connection={connection}
+        />
+      ) : navTab === 'insights' ? (
+        <InsightsView
+          palette={palette}
+          styles={styles}
+          auditLogs={auditLogs}
+          insets={insets}
+        />
+      ) : (
+        <ScrollView
+          contentContainerStyle={[
+            styles.scrollContent,
+            {
+              paddingTop: insets.top + 16,
+              paddingBottom: Math.max(insets.bottom, Platform.OS === 'web' ? 34 : 18) + 110,
+            },
+          ]}
+          showsVerticalScrollIndicator={false}
+        >
         <View style={styles.header}>
           <View style={styles.brandLockup}>
             <View style={styles.brandMark}>
@@ -466,7 +662,9 @@ export default function HomeScreen() {
                 ? 'Mitzy is speaking'
                 : isRecognizing
                   ? 'Recognizing your sign'
-                  : 'Mitzy is listening'}
+                  : currentSign
+                    ? 'Mitzy is listening'
+                    : 'Ready to listen'}
             </Text>
           </View>
           {isSpeaking && (
@@ -498,26 +696,40 @@ export default function HomeScreen() {
           </View>
 
           <View style={styles.translationBody}>
-            <Text style={styles.translationCaption}>I SEE</Text>
+            <Text style={styles.translationCaption}>
+              {currentSign ? 'I SEE' : 'TRANSLATE'}
+            </Text>
             <Text
               accessibilityLiveRegion="polite"
-              style={styles.translationText}
+              style={[
+                styles.translationText,
+                !currentSign && styles.translationPlaceholder,
+              ]}
               numberOfLines={2}
               adjustsFontSizeToFit
             >
-              {currentSign}
+              {currentSign ?? 'Waiting for sign…'}
             </Text>
-            <View style={styles.confidenceRow}>
-              <View style={styles.confidenceTrack}>
-                <View
-                  style={[
-                    styles.confidenceFill,
-                    { width: `${Math.round(confidence * 100)}%` },
-                  ]}
-                />
+            {confidence !== null ? (
+              <View style={styles.confidenceRow}>
+                <View style={styles.confidenceTrack}>
+                  <View
+                    style={[
+                      styles.confidenceFill,
+                      { width: `${Math.round(confidence * 100)}%` },
+                    ]}
+                  />
+                </View>
+                <Text style={styles.confidenceText}>{confidenceLabel}</Text>
               </View>
-              <Text style={styles.confidenceText}>{confidenceLabel}</Text>
-            </View>
+            ) : (
+              <View style={styles.confidenceRow}>
+                <Feather name="activity" size={13} color="rgba(255,255,255,0.65)" />
+                <Text style={styles.confidenceText}>
+                  {connection === 'connected' ? 'Ready for sign input' : 'Connect glove to start'}
+                </Text>
+              </View>
+            )}
           </View>
 
           <View style={styles.waveform} accessibilityLabel="Live listening waveform">
@@ -559,10 +771,10 @@ export default function HomeScreen() {
                 accessibilityLabel="Simulate a glove gesture"
                 testID="simulate-gesture-button"
                 onPress={recognizeDemoGesture}
-                disabled={connection !== 'connected'}
+                disabled={isConnecting}
                 style={({ pressed }) => [
                   styles.gestureButton,
-                  connection !== 'connected' && styles.disabledButton,
+                  isConnecting && styles.disabledButton,
                   pressed && styles.pressed,
                 ]}
               >
@@ -576,43 +788,57 @@ export default function HomeScreen() {
         <View style={styles.sectionHeader}>
           <View>
             <Text style={styles.sectionTitle}>Recent signs</Text>
-            <Text style={styles.sectionCaption}>From this conversation</Text>
+            <Text style={styles.sectionCaption}>
+              {recentSigns.length > 0 ? 'From this conversation' : 'No signs recorded yet'}
+            </Text>
           </View>
           <View style={styles.countBadge}>
             <Text style={styles.countBadgeText}>{recentSigns.length}</Text>
           </View>
         </View>
 
-        <FlatList
-          data={recentSigns}
-          scrollEnabled={false}
-          keyExtractor={(item) => item.id}
-          contentContainerStyle={styles.signList}
-          renderItem={({ item, index }) => (
-            <View style={[styles.signRow, index === 0 && styles.signRowActive]}>
-              <View style={[styles.signIcon, index === 0 && styles.signIconActive]}>
-                <Feather
-                  name={index === 0 ? 'radio' : index === 1 ? 'heart' : 'message-circle'}
-                  size={17}
-                  color={index === 0 ? palette.primary : palette.mutedForeground}
-                />
-              </View>
-              <View style={styles.signCopy}>
-                <Text style={styles.signLabel}>{item.label}</Text>
-                <Text style={styles.signTime}>
-                  {item.time} · {Math.round(item.confidence * 100)}% match
-                </Text>
-              </View>
-              {index === 0 ? (
-                <View style={styles.nowBadge}>
-                  <Text style={styles.nowBadgeText}>NOW</Text>
-                </View>
-              ) : (
-                <Feather name="chevron-right" size={16} color={palette.mutedForeground} />
-              )}
+        {recentSigns.length === 0 ? (
+          <View style={styles.emptySignsContainer}>
+            <View style={styles.emptySignsIconWrap}>
+              <Feather name="inbox" size={22} color={palette.primary} />
             </View>
-          )}
-        />
+            <Text style={styles.emptySignsTitle}>No signs yet</Text>
+            <Text style={styles.emptySignsSubtitle}>
+              When you perform a gesture with the glove, it will appear here.
+            </Text>
+          </View>
+        ) : (
+          <FlatList
+            data={recentSigns}
+            scrollEnabled={false}
+            keyExtractor={(item) => item.id}
+            contentContainerStyle={styles.signList}
+            renderItem={({ item, index }) => (
+              <View style={[styles.signRow, index === 0 && styles.signRowActive]}>
+                <View style={[styles.signIcon, index === 0 && styles.signIconActive]}>
+                  <Feather
+                    name={index === 0 ? 'radio' : index === 1 ? 'heart' : 'message-circle'}
+                    size={17}
+                    color={index === 0 ? palette.primary : palette.mutedForeground}
+                  />
+                </View>
+                <View style={styles.signCopy}>
+                  <Text style={styles.signLabel}>{item.label}</Text>
+                  <Text style={styles.signTime}>
+                    {item.time} · {Math.round(item.confidence * 100)}% match
+                  </Text>
+                </View>
+                {index === 0 ? (
+                  <View style={styles.nowBadge}>
+                    <Text style={styles.nowBadgeText}>NOW</Text>
+                  </View>
+                ) : (
+                  <Feather name="chevron-right" size={16} color={palette.mutedForeground} />
+                )}
+              </View>
+            )}
+          />
+        )}
 
         <Pressable
           accessibilityRole="button"
@@ -633,6 +859,87 @@ export default function HomeScreen() {
           <Feather name="arrow-up-right" size={18} color={palette.primary} />
         </Pressable>
       </ScrollView>
+      )}
+
+      {/* ── Bottom Navigation Bar (matches Mitzy PDF Home Page) ── */}
+      <View style={[styles.bottomNavContainer, { paddingBottom: Math.max(insets.bottom, 12) }]}>
+        <View style={styles.bottomNavBar}>
+          <Pressable
+            accessibilityRole="tab"
+            accessibilityLabel="Home tab"
+            onPress={() => setNavTab('home')}
+            style={styles.bottomNavItem}
+          >
+            <View style={[styles.bottomNavIconWrap, navTab === 'home' && styles.bottomNavIconActive]}>
+              <Feather
+                name="home"
+                size={18}
+                color={navTab === 'home' ? palette.primary : palette.mutedForeground}
+              />
+            </View>
+            <Text style={[styles.bottomNavText, navTab === 'home' && styles.bottomNavTextActive]}>
+              Home
+            </Text>
+          </Pressable>
+
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="Open translate view"
+            onPress={() => setTranslateOpen(true)}
+            style={styles.bottomNavItem}
+          >
+            <View style={styles.bottomNavIconWrap}>
+              <Feather name="message-circle" size={18} color={palette.mutedForeground} />
+            </View>
+            <Text style={styles.bottomNavText}>Translate</Text>
+          </Pressable>
+
+          <Pressable
+            accessibilityRole="tab"
+            accessibilityLabel="Audit Log tab"
+            onPress={() => setNavTab('audit')}
+            style={styles.bottomNavItem}
+          >
+            <View style={[styles.bottomNavIconWrap, navTab === 'audit' && styles.bottomNavIconActive]}>
+              <Feather
+                name="file-text"
+                size={18}
+                color={navTab === 'audit' ? palette.primary : palette.mutedForeground}
+              />
+            </View>
+            <Text style={[styles.bottomNavText, navTab === 'audit' && styles.bottomNavTextActive]}>
+              Audit Log
+            </Text>
+          </Pressable>
+
+          <Pressable
+            accessibilityRole="tab"
+            accessibilityLabel="Insights tab"
+            onPress={() => setNavTab('insights')}
+            style={styles.bottomNavItem}
+          >
+            <View style={[styles.bottomNavIconWrap, navTab === 'insights' && styles.bottomNavIconActive]}>
+              <Feather
+                name="bar-chart-2"
+                size={18}
+                color={navTab === 'insights' ? palette.primary : palette.mutedForeground}
+              />
+            </View>
+            <Text style={[styles.bottomNavText, navTab === 'insights' && styles.bottomNavTextActive]}>
+              Insights
+            </Text>
+          </Pressable>
+        </View>
+      </View>
+
+      <TranslateModal
+        visible={translateOpen}
+        onClose={() => setTranslateOpen(false)}
+        currentSign={currentSign}
+        palette={palette}
+        styles={styles}
+        mascotFloat={mascotFloat}
+      />
 
       <SettingsModal
         visible={settingsOpen}
@@ -886,6 +1193,312 @@ function CalibrationModal({
   );
 }
 
+function AuditLogView({
+  palette,
+  styles,
+  auditLogs,
+  auditFilter,
+  setAuditFilter,
+  onClearLogs,
+  onAddSample,
+  insets,
+  connection,
+}: {
+  palette: ReturnType<typeof useColors>;
+  styles: ReturnType<typeof makeStyles>;
+  auditLogs: AuditEvent[];
+  auditFilter: 'all' | 'sign' | 'system';
+  setAuditFilter: (f: 'all' | 'sign' | 'system') => void;
+  onClearLogs: () => void;
+  onAddSample: () => void;
+  insets: any;
+  connection: ConnectionState;
+}) {
+  const filtered = useMemo(() => {
+    if (auditFilter === 'sign') return auditLogs.filter((l) => l.type === 'sign');
+    if (auditFilter === 'system') return auditLogs.filter((l) => l.type !== 'sign');
+    return auditLogs;
+  }, [auditLogs, auditFilter]);
+
+  const signCount = auditLogs.filter((l) => l.type === 'sign').length;
+  const sysCount = auditLogs.filter((l) => l.type !== 'sign').length;
+  const avgConf = useMemo(() => {
+    const signs = auditLogs.filter((l) => l.confidence !== undefined);
+    if (!signs.length) return '—';
+    const total = signs.reduce((acc, s) => acc + (s.confidence ?? 0), 0);
+    return `${Math.round((total / signs.length) * 100)}%`;
+  }, [auditLogs]);
+
+  return (
+    <ScrollView
+      contentContainerStyle={[
+        styles.scrollContent,
+        {
+          paddingTop: insets.top + 16,
+          paddingBottom: Math.max(insets.bottom, Platform.OS === 'web' ? 34 : 18) + 110,
+        },
+      ]}
+      showsVerticalScrollIndicator={false}
+    >
+      {/* Header */}
+      <View style={styles.header}>
+        <View>
+          <Text style={styles.auditTitle}>Audit Log</Text>
+          <Text style={styles.auditSubtitle}>Verifiable gesture & system activity records</Text>
+        </View>
+        <View style={styles.auditHeaderActions}>
+          <Pressable
+            accessibilityLabel="Add sample log"
+            onPress={onAddSample}
+            style={({ pressed }) => [styles.auditHeaderBtn, pressed && styles.pressed]}
+          >
+            <Feather name="plus" size={16} color={palette.primary} />
+          </Pressable>
+          <Pressable
+            accessibilityLabel="Clear audit log"
+            onPress={onClearLogs}
+            style={({ pressed }) => [styles.auditHeaderBtn, pressed && styles.pressed]}
+          >
+            <Feather name="trash-2" size={16} color={palette.destructive} />
+          </Pressable>
+        </View>
+      </View>
+
+      {/* Metrics Row */}
+      <View style={styles.auditMetricsRow}>
+        <View style={styles.auditMetricCard}>
+          <Text style={styles.auditMetricValue}>{signCount}</Text>
+          <Text style={styles.auditMetricLabel}>Signs Verified</Text>
+        </View>
+        <View style={styles.auditMetricCard}>
+          <Text style={styles.auditMetricValue}>{avgConf}</Text>
+          <Text style={styles.auditMetricLabel}>Avg Accuracy</Text>
+        </View>
+        <View style={styles.auditMetricCard}>
+          <Text style={styles.auditMetricValue}>{sysCount}</Text>
+          <Text style={styles.auditMetricLabel}>System Logs</Text>
+        </View>
+        <View style={styles.auditMetricCard}>
+          <View
+            style={[
+              styles.auditStatusDot,
+              connection === 'connected' ? styles.statusConnected : styles.statusDisconnected,
+            ]}
+          />
+          <Text style={styles.auditMetricLabel}>
+            {connection === 'connected' ? 'Online' : 'Offline'}
+          </Text>
+        </View>
+      </View>
+
+      {/* Filter Chips */}
+      <View style={styles.auditFilterRow}>
+        <Pressable
+          onPress={() => setAuditFilter('all')}
+          style={[styles.auditFilterChip, auditFilter === 'all' && styles.auditFilterChipActive]}
+        >
+          <Text style={[styles.auditFilterText, auditFilter === 'all' && styles.auditFilterTextActive]}>
+            All ({auditLogs.length})
+          </Text>
+        </Pressable>
+        <Pressable
+          onPress={() => setAuditFilter('sign')}
+          style={[styles.auditFilterChip, auditFilter === 'sign' && styles.auditFilterChipActive]}
+        >
+          <Text style={[styles.auditFilterText, auditFilter === 'sign' && styles.auditFilterTextActive]}>
+            Signs ({signCount})
+          </Text>
+        </Pressable>
+        <Pressable
+          onPress={() => setAuditFilter('system')}
+          style={[styles.auditFilterChip, auditFilter === 'system' && styles.auditFilterChipActive]}
+        >
+          <Text style={[styles.auditFilterText, auditFilter === 'system' && styles.auditFilterTextActive]}>
+            System ({sysCount})
+          </Text>
+        </Pressable>
+      </View>
+
+      {/* Log Entries */}
+      {filtered.length === 0 ? (
+        <View style={styles.emptySignsContainer}>
+          <View style={styles.emptySignsIconWrap}>
+            <Feather name="file-text" size={22} color={palette.primary} />
+          </View>
+          <Text style={styles.emptySignsTitle}>No audit records</Text>
+          <Text style={styles.emptySignsSubtitle}>
+            When gestures are performed or hardware connects, verified logs will appear here.
+          </Text>
+          <Pressable
+            onPress={onAddSample}
+            style={[styles.gestureButton, { marginTop: 14 }]}
+          >
+            <Text style={styles.gestureButtonText}>Add test event</Text>
+          </Pressable>
+        </View>
+      ) : (
+        <View style={styles.auditList}>
+          {filtered.map((item) => (
+            <View key={item.id} style={styles.auditCard}>
+              <View style={styles.auditCardHeader}>
+                <View style={styles.auditCardTitleRow}>
+                  <View
+                    style={[
+                      styles.auditTypeIcon,
+                      item.type === 'sign' ? styles.auditTypeSign : styles.auditTypeSystem,
+                    ]}
+                  >
+                    <Feather
+                      name={item.type === 'sign' ? 'check-circle' : item.type === 'calibration' ? 'sliders' : 'radio'}
+                      size={14}
+                      color={item.type === 'sign' ? palette.primary : palette.accentForeground}
+                    />
+                  </View>
+                  <Text style={styles.auditItemTitle}>{item.title}</Text>
+                </View>
+                <View style={styles.auditBadge}>
+                  <Text style={styles.auditBadgeText}>{item.badge}</Text>
+                </View>
+              </View>
+              <Text style={styles.auditItemDetail}>{item.detail}</Text>
+              <View style={styles.auditCardFooter}>
+                <View style={styles.auditTimeRow}>
+                  <Feather name="clock" size={11} color={palette.mutedForeground} />
+                  <Text style={styles.auditItemTime}>{item.date} · {item.time}</Text>
+                </View>
+                {item.confidence !== undefined && (
+                  <Text style={styles.auditItemConf}>
+                    {Math.round(item.confidence * 100)}% match
+                  </Text>
+                )}
+              </View>
+            </View>
+          ))}
+        </View>
+      )}
+    </ScrollView>
+  );
+}
+
+function InsightsView({
+  palette,
+  styles,
+  auditLogs,
+  insets,
+}: {
+  palette: ReturnType<typeof useColors>;
+  styles: ReturnType<typeof makeStyles>;
+  auditLogs: AuditEvent[];
+  insets: any;
+}) {
+  const signs = auditLogs.filter((l) => l.type === 'sign');
+  return (
+    <ScrollView
+      contentContainerStyle={[
+        styles.scrollContent,
+        {
+          paddingTop: insets.top + 16,
+          paddingBottom: Math.max(insets.bottom, Platform.OS === 'web' ? 34 : 18) + 110,
+        },
+      ]}
+      showsVerticalScrollIndicator={false}
+    >
+      <View style={styles.header}>
+        <View>
+          <Text style={styles.auditTitle}>Insights</Text>
+          <Text style={styles.auditSubtitle}>Usage analytics and gesture accuracy</Text>
+        </View>
+      </View>
+
+      <View style={styles.insightsCard}>
+        <Text style={styles.insightsCardTitle}>Today's Activity</Text>
+        <View style={styles.insightsStatsRow}>
+          <View style={styles.insightsStatCol}>
+            <Text style={styles.insightsStatNum}>{signs.length}</Text>
+            <Text style={styles.insightsStatLabel}>Signs Translated</Text>
+          </View>
+          <View style={styles.insightsStatDivider} />
+          <View style={styles.insightsStatCol}>
+            <Text style={styles.insightsStatNum}>96%</Text>
+            <Text style={styles.insightsStatLabel}>Accuracy Rate</Text>
+          </View>
+          <View style={styles.insightsStatDivider} />
+          <View style={styles.insightsStatCol}>
+            <Text style={styles.insightsStatNum}>15m</Text>
+            <Text style={styles.insightsStatLabel}>Session Time</Text>
+          </View>
+        </View>
+      </View>
+
+      <View style={styles.insightsSection}>
+        <Text style={styles.insightsSectionTitle}>Top Signs</Text>
+        {signs.length === 0 ? (
+          <Text style={styles.insightsEmptyText}>No sign frequency data recorded yet.</Text>
+        ) : (
+          signs.slice(0, 5).map((s, idx) => (
+            <View key={s.id} style={styles.frequencyRow}>
+              <Text style={styles.frequencyName}>{s.title}</Text>
+              <View style={styles.frequencyBarTrack}>
+                <View style={[styles.frequencyBarFill, { width: `${Math.max(25, 100 - idx * 15)}%` }]} />
+              </View>
+              <Text style={styles.frequencyCount}>{Math.max(1, 5 - idx)}x</Text>
+            </View>
+          ))
+        )}
+      </View>
+    </ScrollView>
+  );
+}
+
+function TranslateModal({
+  visible,
+  onClose,
+  currentSign,
+  palette,
+  styles,
+  mascotFloat,
+}: {
+  visible: boolean;
+  onClose: () => void;
+  currentSign: string | null;
+  palette: ReturnType<typeof useColors>;
+  styles: ReturnType<typeof makeStyles>;
+  mascotFloat: Animated.Value;
+}) {
+  return (
+    <Modal visible={visible} animationType="fade" transparent onRequestClose={onClose}>
+      <View style={styles.translateScreen}>
+        <Pressable onPress={onClose} style={styles.translateCloseBtn} accessibilityLabel="Close Translate">
+          <Feather name="x" size={20} color="#fff" />
+        </Pressable>
+
+        <View style={styles.translateBody}>
+          <Text style={styles.translateSubtitle}>LIVE TRANSLATE</Text>
+          <Text style={styles.translateSignText} numberOfLines={3} adjustsFontSizeToFit>
+            {currentSign ?? 'Make a sign…'}
+          </Text>
+          <Text style={styles.translateHint}>
+            {currentSign ? 'Translated from ISL glove in real time' : 'Waiting for glove input'}
+          </Text>
+        </View>
+
+        <Animated.View
+          style={[
+            styles.translateMascotWrap,
+            { transform: [{ translateY: mascotFloat }] },
+          ]}
+        >
+          <Image
+            source={require('../assets/images/mitzy-mascot.png')}
+            style={styles.translateMascotImage}
+            resizeMode="contain"
+          />
+        </Animated.View>
+      </View>
+    </Modal>
+  );
+}
+
 const makeStyles = (palette: ReturnType<typeof useColors>) =>
   StyleSheet.create({
     screen: { flex: 1, backgroundColor: palette.background },
@@ -1048,6 +1661,13 @@ const makeStyles = (palette: ReturnType<typeof useColors>) =>
       letterSpacing: -1.7,
       marginTop: 3,
     },
+    translationPlaceholder: {
+      fontSize: 25,
+      letterSpacing: -0.5,
+      color: 'rgba(255,255,255,0.68)',
+      fontWeight: '500',
+      marginTop: 6,
+    },
     confidenceRow: { flexDirection: 'row', alignItems: 'center', gap: 9, marginTop: 16 },
     confidenceTrack: {
       width: 63,
@@ -1108,6 +1728,40 @@ const makeStyles = (palette: ReturnType<typeof useColors>) =>
     },
     countBadgeText: { color: palette.accentForeground, fontWeight: '700', fontSize: 12 },
     signList: { gap: 9 },
+    emptySignsContainer: {
+      backgroundColor: palette.card,
+      borderRadius: 18,
+      borderWidth: 1,
+      borderColor: palette.border,
+      borderStyle: 'dashed',
+      paddingVertical: 28,
+      paddingHorizontal: 20,
+      alignItems: 'center',
+      justifyContent: 'center',
+    },
+    emptySignsIconWrap: {
+      width: 44,
+      height: 44,
+      borderRadius: 14,
+      backgroundColor: palette.secondary,
+      alignItems: 'center',
+      justifyContent: 'center',
+      marginBottom: 10,
+    },
+    emptySignsTitle: {
+      color: palette.foreground,
+      fontWeight: '600',
+      fontSize: 14,
+      marginBottom: 4,
+    },
+    emptySignsSubtitle: {
+      color: palette.mutedForeground,
+      fontWeight: '400',
+      fontSize: 12,
+      textAlign: 'center',
+      lineHeight: 18,
+      maxWidth: 240,
+    },
     signRow: {
       minHeight: 65,
       borderRadius: 17,
@@ -1359,4 +2013,373 @@ const makeStyles = (palette: ReturnType<typeof useColors>) =>
     primaryButtonText: { color: palette.primaryForeground, fontWeight: '700', fontSize: 13 },
     skipButton: { padding: 13, marginTop: 2 },
     skipButtonText: { color: palette.mutedForeground, fontWeight: '600', fontSize: 12 },
+
+    // ── Bottom Navigation Bar ──
+    bottomNavContainer: {
+      position: 'absolute',
+      bottom: 0,
+      left: 0,
+      right: 0,
+      alignItems: 'center',
+      paddingHorizontal: 16,
+      pointerEvents: 'box-none',
+    },
+    bottomNavBar: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'space-around',
+      backgroundColor: palette.card,
+      borderRadius: 28,
+      paddingVertical: 9,
+      paddingHorizontal: 8,
+      width: '100%',
+      maxWidth: 420,
+      shadowColor: '#000',
+      shadowOpacity: 0.1,
+      shadowRadius: 20,
+      shadowOffset: { width: 0, height: 6 },
+      elevation: 7,
+      borderWidth: 1,
+      borderColor: palette.border,
+    },
+    bottomNavItem: {
+      alignItems: 'center',
+      justifyContent: 'center',
+      paddingHorizontal: 10,
+      paddingVertical: 2,
+    },
+    bottomNavIconWrap: {
+      width: 36,
+      height: 28,
+      borderRadius: 14,
+      alignItems: 'center',
+      justifyContent: 'center',
+    },
+    bottomNavIconActive: {
+      backgroundColor: palette.secondary,
+    },
+    bottomNavText: {
+      color: palette.mutedForeground,
+      fontWeight: '500',
+      fontSize: 10,
+      marginTop: 2,
+    },
+    bottomNavTextActive: {
+      color: palette.primary,
+      fontWeight: '700',
+    },
+
+    // ── Audit Log View ──
+    auditTitle: {
+      color: palette.foreground,
+      fontWeight: '800',
+      fontSize: 26,
+      letterSpacing: -0.8,
+    },
+    auditSubtitle: {
+      color: palette.mutedForeground,
+      fontWeight: '400',
+      fontSize: 12,
+      marginTop: 2,
+    },
+    auditHeaderActions: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 8,
+    },
+    auditHeaderBtn: {
+      width: 38,
+      height: 38,
+      borderRadius: 13,
+      backgroundColor: palette.card,
+      borderWidth: 1,
+      borderColor: palette.border,
+      alignItems: 'center',
+      justifyContent: 'center',
+    },
+    auditMetricsRow: {
+      flexDirection: 'row',
+      gap: 9,
+      marginTop: 20,
+      marginBottom: 16,
+    },
+    auditMetricCard: {
+      flex: 1,
+      backgroundColor: palette.card,
+      borderRadius: 16,
+      borderWidth: 1,
+      borderColor: palette.border,
+      paddingVertical: 12,
+      paddingHorizontal: 8,
+      alignItems: 'center',
+      justifyContent: 'center',
+    },
+    auditMetricValue: {
+      color: palette.foreground,
+      fontWeight: '700',
+      fontSize: 18,
+    },
+    auditMetricLabel: {
+      color: palette.mutedForeground,
+      fontWeight: '500',
+      fontSize: 10,
+      marginTop: 3,
+      textAlign: 'center',
+    },
+    auditStatusDot: {
+      width: 10,
+      height: 10,
+      borderRadius: 5,
+      marginBottom: 3,
+    },
+    auditFilterRow: {
+      flexDirection: 'row',
+      gap: 8,
+      marginBottom: 16,
+    },
+    auditFilterChip: {
+      paddingVertical: 7,
+      paddingHorizontal: 14,
+      borderRadius: 12,
+      backgroundColor: palette.card,
+      borderWidth: 1,
+      borderColor: palette.border,
+    },
+    auditFilterChipActive: {
+      backgroundColor: palette.primary,
+      borderColor: palette.primary,
+    },
+    auditFilterText: {
+      color: palette.mutedForeground,
+      fontWeight: '600',
+      fontSize: 11,
+    },
+    auditFilterTextActive: {
+      color: palette.primaryForeground,
+    },
+    auditList: {
+      gap: 10,
+    },
+    auditCard: {
+      backgroundColor: palette.card,
+      borderRadius: 18,
+      borderWidth: 1,
+      borderColor: palette.border,
+      padding: 15,
+    },
+    auditCardHeader: {
+      flexDirection: 'row',
+      justifyContent: 'space-between',
+      alignItems: 'center',
+      marginBottom: 6,
+    },
+    auditCardTitleRow: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 9,
+    },
+    auditTypeIcon: {
+      width: 28,
+      height: 28,
+      borderRadius: 9,
+      alignItems: 'center',
+      justifyContent: 'center',
+    },
+    auditTypeSign: {
+      backgroundColor: palette.secondary,
+    },
+    auditTypeSystem: {
+      backgroundColor: palette.accent,
+    },
+    auditItemTitle: {
+      color: palette.foreground,
+      fontWeight: '700',
+      fontSize: 15,
+    },
+    auditBadge: {
+      paddingVertical: 3,
+      paddingHorizontal: 7,
+      borderRadius: 6,
+      backgroundColor: palette.secondary,
+    },
+    auditBadgeText: {
+      color: palette.primary,
+      fontWeight: '700',
+      fontSize: 9,
+      letterSpacing: 0.6,
+    },
+    auditItemDetail: {
+      color: palette.mutedForeground,
+      fontWeight: '400',
+      fontSize: 12,
+      lineHeight: 17,
+      marginBottom: 10,
+    },
+    auditCardFooter: {
+      flexDirection: 'row',
+      justifyContent: 'space-between',
+      alignItems: 'center',
+      borderTopWidth: 1,
+      borderTopColor: palette.border,
+      paddingTop: 8,
+    },
+    auditTimeRow: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 5,
+    },
+    auditItemTime: {
+      color: palette.mutedForeground,
+      fontWeight: '400',
+      fontSize: 10,
+    },
+    auditItemConf: {
+      color: palette.success,
+      fontWeight: '600',
+      fontSize: 11,
+    },
+
+    // ── Insights View ──
+    insightsCard: {
+      backgroundColor: palette.card,
+      borderRadius: 22,
+      borderWidth: 1,
+      borderColor: palette.border,
+      padding: 18,
+      marginTop: 20,
+      marginBottom: 20,
+    },
+    insightsCardTitle: {
+      color: palette.foreground,
+      fontWeight: '700',
+      fontSize: 15,
+      marginBottom: 14,
+    },
+    insightsStatsRow: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+    },
+    insightsStatCol: {
+      flex: 1,
+      alignItems: 'center',
+    },
+    insightsStatNum: {
+      color: palette.primary,
+      fontWeight: '800',
+      fontSize: 22,
+    },
+    insightsStatLabel: {
+      color: palette.mutedForeground,
+      fontWeight: '500',
+      fontSize: 10,
+      marginTop: 3,
+    },
+    insightsStatDivider: {
+      width: 1,
+      height: 28,
+      backgroundColor: palette.border,
+    },
+    insightsSection: {
+      backgroundColor: palette.card,
+      borderRadius: 22,
+      borderWidth: 1,
+      borderColor: palette.border,
+      padding: 18,
+    },
+    insightsSectionTitle: {
+      color: palette.foreground,
+      fontWeight: '700',
+      fontSize: 15,
+      marginBottom: 14,
+    },
+    insightsEmptyText: {
+      color: palette.mutedForeground,
+      fontSize: 12,
+      textAlign: 'center',
+      paddingVertical: 12,
+    },
+    frequencyRow: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 12,
+      marginBottom: 10,
+    },
+    frequencyName: {
+      width: 80,
+      color: palette.foreground,
+      fontWeight: '600',
+      fontSize: 12,
+    },
+    frequencyBarTrack: {
+      flex: 1,
+      height: 7,
+      borderRadius: 4,
+      backgroundColor: palette.muted,
+      overflow: 'hidden',
+    },
+    frequencyBarFill: {
+      height: '100%',
+      backgroundColor: palette.primary,
+      borderRadius: 4,
+    },
+    frequencyCount: {
+      width: 30,
+      color: palette.mutedForeground,
+      fontWeight: '600',
+      fontSize: 11,
+      textAlign: 'right',
+    },
+
+    // ── Translate Full-Screen Modal (PDF Page 3) ──
+    translateScreen: {
+      flex: 1,
+      backgroundColor: '#7272F5',
+      justifyContent: 'space-between',
+      paddingTop: 50,
+      paddingHorizontal: 26,
+    },
+    translateCloseBtn: {
+      alignSelf: 'flex-end',
+      width: 38,
+      height: 38,
+      borderRadius: 19,
+      backgroundColor: 'rgba(255,255,255,0.22)',
+      alignItems: 'center',
+      justifyContent: 'center',
+    },
+    translateBody: {
+      flex: 1,
+      justifyContent: 'center',
+      paddingBottom: 40,
+    },
+    translateSubtitle: {
+      color: 'rgba(255,255,255,0.65)',
+      fontWeight: '700',
+      fontSize: 11,
+      letterSpacing: 1.5,
+      marginBottom: 8,
+    },
+    translateSignText: {
+      color: '#ffffff',
+      fontWeight: '800',
+      fontSize: 42,
+      letterSpacing: -1,
+      lineHeight: 48,
+    },
+    translateHint: {
+      color: 'rgba(255,255,255,0.7)',
+      fontWeight: '400',
+      fontSize: 13,
+      marginTop: 14,
+    },
+    translateMascotWrap: {
+      alignItems: 'center',
+      justifyContent: 'flex-end',
+      marginBottom: -30,
+    },
+    translateMascotImage: {
+      width: 220,
+      height: 220,
+    },
   });
